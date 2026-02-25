@@ -32,13 +32,21 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
 
 # ─── Configuration ───────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', 'API_KEY')
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', 'VOTRE_CLE_API_ICI')
 UPLOAD_FOLDER = Path('uploads')
 OUTPUT_FOLDER = Path('outputs')
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 OUTPUT_FOLDER.mkdir(exist_ok=True)
 
-# ─── Prompt Comptable ──
+# ─── Config Email (optionnel) ────────────────────────────────────
+EMAIL_ADDRESS = os.environ.get('EMAIL_ADDRESS', 'ton-email@gmail.com')
+EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD', 'ton-mot-de-passe-application')
+IMAP_SERVER = 'imap.gmail.com'
+SMTP_SERVER = 'smtp.gmail.com'
+SMTP_PORT = 465
+CHECK_INTERVAL = 30
+
+# ─── Prompt Comptable ────────────────────────────────────────────
 SYSTEM_PROMPT = """Tu es un expert-comptable français spécialisé en Plan Comptable Général (PCG), fiscalité TVA et préparation de fichiers d'import pour Sage. Tu traites des tickets de frais professionnels.
 
 RÈGLES IMPÉRATIVES :
@@ -51,6 +59,8 @@ RÈGLES IMPÉRATIVES :
 7. Dates au format JJ/MM/AAAA - utilise la date figurant sur le document
 8. Montants avec 2 décimales
 9. En cas de doute : signaler plutôt que deviner
+
+IMPORTANT : Une page peut contenir PLUSIEURS tickets côte à côte ou empilés. Analyse CHAQUE ticket séparément et produis une écriture par ticket.
 
 RÈGLES TVA :
 - Péage, autoroute : TVA 20% → 100% déductible
@@ -103,15 +113,32 @@ def extract_text_from_pdf(pdf_bytes):
         return ""
 
 
+def split_pdf_pages(pdf_bytes, filename):
+    """Découpe un PDF en pages individuelles"""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    pages = []
+
+    for i, page in enumerate(reader.pages):
+        writer = PdfWriter()
+        writer.add_page(page)
+        output = io.BytesIO()
+        writer.write(output)
+        output.seek(0)
+        page_bytes = output.read()
+
+        page_name = f"{Path(filename).stem}_page{i+1}.pdf"
+        pages.append({'filename': page_name, 'bytes': page_bytes, 'original_filename': filename})
+
+    return pages
+
+
 def analyze_ticket_with_claude(pdf_bytes, filename="ticket.pdf"):
     """Envoie un ticket à Claude pour analyse comptable"""
     text = extract_text_from_pdf(pdf_bytes)
-    
+
     if len(text.strip()) > 50:
-        # PDF texte → envoi du texte
         user_content = f"Analyse ce ticket de frais et produis les écritures comptables :\n\n{text}"
     else:
-        # Scan/image → envoi en vision
         pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
         user_content = [
             {
@@ -124,10 +151,10 @@ def analyze_ticket_with_claude(pdf_bytes, filename="ticket.pdf"):
             },
             {
                 "type": "text",
-                "text": "Analyse ce ticket de frais et produis les écritures comptables."
+                "text": "Analyse ce ticket de frais et produis les écritures comptables. Une page peut contenir plusieurs tickets, traite-les tous séparément."
             }
         ]
-    
+
     response = requests.post(
         'https://api.anthropic.com/v1/messages',
         headers={
@@ -137,21 +164,20 @@ def analyze_ticket_with_claude(pdf_bytes, filename="ticket.pdf"):
         },
         json={
             'model': 'claude-sonnet-4-20250514',
-            'max_tokens': 2000,
+            'max_tokens': 4000,
             'system': SYSTEM_PROMPT,
             'messages': [{'role': 'user', 'content': user_content}]
         },
-        timeout=60
+        timeout=120
     )
-    
+
     if response.status_code != 200:
         return {"exploitable": False, "raison_non_exploitable": f"Erreur API ({response.status_code})", "ecritures": []}
-    
+
     result_text = response.json()['content'][0]['text']
-    # Nettoyer les backticks
     result_text = re.sub(r'```json\s*', '', result_text)
     result_text = re.sub(r'```\s*', '', result_text).strip()
-    
+
     try:
         return json.loads(result_text)
     except json.JSONDecodeError:
@@ -162,7 +188,7 @@ def stamp_pdf_with_s(pdf_bytes):
     """Ajoute un 'S' rouge sur le PDF"""
     reader = PdfReader(io.BytesIO(pdf_bytes))
     writer = PdfWriter()
-    
+
     for page in reader.pages:
         packet = io.BytesIO()
         w = float(page.mediabox.width)
@@ -174,11 +200,11 @@ def stamp_pdf_with_s(pdf_bytes):
         c.drawString(w - 70, h - 70, "S")
         c.save()
         packet.seek(0)
-        
+
         overlay = PdfReader(packet)
         page.merge_page(overlay.pages[0])
         writer.add_page(page)
-    
+
     output = io.BytesIO()
     writer.write(output)
     output.seek(0)
@@ -192,7 +218,7 @@ def merge_pdfs(pdf_list):
         reader = PdfReader(io.BytesIO(pdf_bytes))
         for page in reader.pages:
             writer.add_page(page)
-    
+
     output = io.BytesIO()
     writer.write(output)
     output.seek(0)
@@ -203,9 +229,8 @@ def create_excel(all_ecritures, alerts=None):
     """Crée le fichier Excel format Sage"""
     wb = Workbook()
     ws = wb.active
-    ws.title = "Écritures comptables"
-    
-    # Styles
+    ws.title = "Ecritures comptables"
+
     header_font = Font(name='Calibri', bold=True, size=11, color='FFFFFF')
     header_fill = PatternFill(start_color='2C3E50', end_color='2C3E50', fill_type='solid')
     header_alignment = Alignment(horizontal='center', vertical='center')
@@ -215,27 +240,25 @@ def create_excel(all_ecritures, alerts=None):
         top=Side(style='thin'),
         bottom=Side(style='thin')
     )
-    
-    # En-têtes
-    headers = ['Date', 'Référence', 'Journal', 'Compte', 'Libellé', 'Débit', 'Crédit']
+
+    headers = ['Date', 'Reference', 'Journal', 'Compte', 'Libelle', 'Debit', 'Credit']
     for col, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=header)
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = header_alignment
         cell.border = border
-    
-    # Données
+
     row = 2
     total_debit = 0
     total_credit = 0
-    
+
     for e in all_ecritures:
         debit = round(float(e.get('debit', 0) or 0), 2)
         credit = round(float(e.get('credit', 0) or 0), 2)
         total_debit += debit
         total_credit += credit
-        
+
         values = [
             e.get('date', ''),
             e.get('reference', ''),
@@ -252,39 +275,38 @@ def create_excel(all_ecritures, alerts=None):
                 cell.number_format = '#,##0.00'
                 cell.alignment = Alignment(horizontal='right')
         row += 1
-    
-    # Ligne de contrôle
+
     row += 1
-    ctrl_fill = PatternFill(start_color='27AE60' if abs(total_debit - total_credit) < 0.01 else 'E74C3C',
-                            end_color='27AE60' if abs(total_debit - total_credit) < 0.01 else 'E74C3C',
-                            fill_type='solid')
+    ctrl_fill = PatternFill(
+        start_color='27AE60' if abs(total_debit - total_credit) < 0.01 else 'E74C3C',
+        end_color='27AE60' if abs(total_debit - total_credit) < 0.01 else 'E74C3C',
+        fill_type='solid'
+    )
     ctrl_font = Font(name='Calibri', bold=True, color='FFFFFF')
-    
-    ws.cell(row=row, column=4, value='CONTRÔLE').font = ctrl_font
+
+    ws.cell(row=row, column=4, value='CONTROLE').font = ctrl_font
     ws.cell(row=row, column=4).fill = ctrl_fill
-    
-    status = 'OK - Équilibre ✓' if abs(total_debit - total_credit) < 0.01 else 'ERREUR - Déséquilibre ✗'
+
+    status = 'OK - Equilibre' if abs(total_debit - total_credit) < 0.01 else 'ERREUR - Desequilibre'
     ws.cell(row=row, column=5, value=status).font = ctrl_font
     ws.cell(row=row, column=5).fill = ctrl_fill
-    
+
     ws.cell(row=row, column=6, value=round(total_debit, 2)).font = ctrl_font
     ws.cell(row=row, column=6).fill = ctrl_fill
     ws.cell(row=row, column=6).number_format = '#,##0.00'
-    
+
     ws.cell(row=row, column=7, value=round(total_credit, 2)).font = ctrl_font
     ws.cell(row=row, column=7).fill = ctrl_fill
     ws.cell(row=row, column=7).number_format = '#,##0.00'
-    
-    # Alertes
+
     if alerts:
         row += 2
         alert_font = Font(name='Calibri', bold=True, color='E74C3C')
-        ws.cell(row=row, column=1, value='⚠️ ALERTES').font = alert_font
+        ws.cell(row=row, column=1, value='ALERTES').font = alert_font
         for alert in alerts:
             row += 1
             ws.cell(row=row, column=1, value=alert)
-    
-    # Largeurs colonnes
+
     ws.column_dimensions['A'].width = 14
     ws.column_dimensions['B'].width = 12
     ws.column_dimensions['C'].width = 10
@@ -292,7 +314,7 @@ def create_excel(all_ecritures, alerts=None):
     ws.column_dimensions['E'].width = 45
     ws.column_dimensions['F'].width = 14
     ws.column_dimensions['G'].width = 14
-    
+
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
@@ -304,20 +326,19 @@ def create_inexploitable_report(inexploitable_tickets):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
-    
-    # Titre
+
     c.setFont("Helvetica-Bold", 18)
     c.setFillColor(red)
-    c.drawString(50, height - 60, "⚠ Justificatifs inexploitables")
-    
+    c.drawString(50, height - 60, "Justificatifs inexploitables")
+
     c.setFont("Helvetica", 11)
     c.setFillColor(black)
     c.drawString(50, height - 85, f"Date de traitement : {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    
+
     c.setFont("Helvetica", 10)
-    c.drawString(50, height - 110, "Les documents suivants n'ont pas pu être exploités pour la saisie comptable.")
-    c.drawString(50, height - 125, "Merci de fournir des justificatifs conformes (facture détaillée avec HT, TVA et TTC).")
-    
+    c.drawString(50, height - 110, "Les documents suivants n'ont pas pu etre exploites pour la saisie comptable.")
+    c.drawString(50, height - 125, "Merci de fournir des justificatifs conformes (facture detaillee avec HT, TVA et TTC).")
+
     y = height - 165
     c.setFont("Helvetica-Bold", 11)
     c.drawString(50, y, "Fichier")
@@ -325,7 +346,7 @@ def create_inexploitable_report(inexploitable_tickets):
     y -= 5
     c.line(50, y, width - 50, y)
     y -= 20
-    
+
     c.setFont("Helvetica", 10)
     for ticket in inexploitable_tickets:
         if y < 80:
@@ -334,7 +355,7 @@ def create_inexploitable_report(inexploitable_tickets):
         c.drawString(50, y, ticket['filename'][:35])
         c.drawString(300, y, ticket['raison'][:50])
         y -= 18
-    
+
     c.save()
     buffer.seek(0)
     return buffer.read()
@@ -348,91 +369,92 @@ def process_tickets(files_data):
     alerts = []
     ticket_num = 1
     results_detail = []
-    
+
+    # Découper les PDFs multi-pages en pages individuelles
+    split_files = []
     for file_info in files_data:
+        reader = PdfReader(io.BytesIO(file_info['bytes']))
+        if len(reader.pages) > 1:
+            pages = split_pdf_pages(file_info['bytes'], file_info['filename'])
+            split_files.extend(pages)
+        else:
+            split_files.append(file_info)
+
+    for file_info in split_files:
         filename = file_info['filename']
         pdf_bytes = file_info['bytes']
-        
-        # Analyse avec Claude
+
         result = analyze_ticket_with_claude(pdf_bytes, filename)
-        
+
         if result.get('exploitable'):
             ecritures = result.get('ecritures', [])
-            
-            # Numérotation séquentielle
+
             for e in ecritures:
                 e['reference'] = f'T{ticket_num}'
                 e['debit'] = round(float(e.get('debit', 0) or 0), 2)
                 e['credit'] = round(float(e.get('credit', 0) or 0), 2)
-            
-            # Vérification équilibre
+
             total_d = sum(e['debit'] for e in ecritures)
             total_c = sum(e['credit'] for e in ecritures)
             if abs(total_d - total_c) > 0.01:
-                alerts.append(f"T{ticket_num} ({filename}) : Déséquilibre détecté ({total_d:.2f} ≠ {total_c:.2f})")
-                # Correction automatique
+                alerts.append(f"T{ticket_num} ({filename}) : Desequilibre detecte ({total_d:.2f} != {total_c:.2f})")
                 ligne_banque = next((e for e in ecritures if e['compte'] == '51200000'), None)
                 if ligne_banque:
                     ligne_banque['credit'] = round(total_d, 2)
-            
+
             all_ecritures.extend(ecritures)
-            
-            # Tampon S
+
             stamped = stamp_pdf_with_s(pdf_bytes)
             exploited_pdfs.append(stamped)
-            
+
             results_detail.append({
                 'filename': filename,
                 'status': 'exploitable',
                 'reference': f'T{ticket_num}',
                 'ecritures': ecritures
             })
-            
+
             ticket_num += 1
         else:
             raison = result.get('raison_non_exploitable', 'Document inexploitable')
             inexploitable_tickets.append({'filename': filename, 'raison': raison})
-            alerts.append(f"⚠ {filename} : {raison}")
-            
+            alerts.append(f"!! {filename} : {raison}")
+
             results_detail.append({
                 'filename': filename,
                 'status': 'inexploitable',
                 'raison': raison
             })
-    
-    # Génération des fichiers
+
     output_files = {}
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    
-    # 1. Excel Sage
+
     if all_ecritures:
         excel_bytes = create_excel(all_ecritures, alerts if alerts else None)
         excel_name = f'Sage_import_{timestamp}.xlsx'
         output_path = OUTPUT_FOLDER / excel_name
         output_path.write_bytes(excel_bytes)
         output_files['excel'] = {'name': excel_name, 'path': str(output_path)}
-    
-    # 2. PDF tickets exploités avec S
+
     if exploited_pdfs:
         merged_stamped = merge_pdfs(exploited_pdfs)
         stamped_name = f'Tickets_exploites_S_{timestamp}.pdf'
         output_path = OUTPUT_FOLDER / stamped_name
         output_path.write_bytes(merged_stamped)
         output_files['stamped_pdf'] = {'name': stamped_name, 'path': str(output_path)}
-    
-    # 3. PDF justificatifs inexploitables
+
     if inexploitable_tickets:
         report = create_inexploitable_report(inexploitable_tickets)
         report_name = f'Justificatifs_inexploites_{timestamp}.pdf'
         output_path = OUTPUT_FOLDER / report_name
         output_path.write_bytes(report)
         output_files['inexploitable_pdf'] = {'name': report_name, 'path': str(output_path)}
-    
+
     return {
         'output_files': output_files,
         'results_detail': results_detail,
         'summary': {
-            'total': len(files_data),
+            'total': len(split_files),
             'exploites': len(exploited_pdfs),
             'inexploites': len(inexploitable_tickets),
             'total_debit': round(sum(e['debit'] for e in all_ecritures), 2),
@@ -440,6 +462,118 @@ def process_tickets(files_data):
             'equilibre': abs(sum(e['debit'] for e in all_ecritures) - sum(e['credit'] for e in all_ecritures)) < 0.01
         }
     }
+
+
+# ─── Email Functions ─────────────────────────────────────────────
+
+import threading
+import time
+
+
+def send_email_with_attachments(to_email, subject, body, attachments):
+    """Envoie un email avec pièces jointes"""
+    msg = MIMEMultipart()
+    msg['From'] = EMAIL_ADDRESS
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    for att_filename, file_bytes in attachments:
+        part = MIMEBase('application', 'octet-stream')
+        part.set_payload(file_bytes)
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', f'attachment; filename="{att_filename}"')
+        msg.attach(part)
+
+    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        server.send_message(msg)
+
+
+def check_emails():
+    """Vérifie les nouveaux emails et traite les PDFs"""
+    while True:
+        try:
+            mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+            mail.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            mail.select('INBOX')
+
+            _, messages = mail.search(None, 'UNSEEN')
+
+            for num in messages[0].split():
+                if not num:
+                    continue
+
+                _, msg_data = mail.fetch(num, '(RFC822)')
+                msg = email.message_from_bytes(msg_data[0][1])
+
+                sender = email.utils.parseaddr(msg['From'])[1]
+                subject = msg['Subject'] or 'Sans objet'
+
+                files_data = []
+                for part in msg.walk():
+                    if part.get_content_type() == 'application/pdf':
+                        att_filename = part.get_filename() or 'document.pdf'
+                        pdf_bytes = part.get_payload(decode=True)
+                        if pdf_bytes:
+                            files_data.append({'filename': att_filename, 'bytes': pdf_bytes})
+
+                if not files_data:
+                    continue
+
+                print(f"Mail de {sender} - {len(files_data)} PDF(s) a traiter")
+
+                results = process_tickets(files_data)
+
+                attachments = []
+                files = results['output_files']
+
+                if files.get('excel'):
+                    with open(files['excel']['path'], 'rb') as f:
+                        attachments.append((files['excel']['name'], f.read()))
+
+                if files.get('stamped_pdf'):
+                    with open(files['stamped_pdf']['path'], 'rb') as f:
+                        attachments.append((files['stamped_pdf']['name'], f.read()))
+
+                if files.get('inexploitable_pdf'):
+                    with open(files['inexploitable_pdf']['path'], 'rb') as f:
+                        attachments.append((files['inexploitable_pdf']['name'], f.read()))
+
+                s = results['summary']
+                body = f"""Bonjour,
+
+Traitement automatique de vos {s['total']} justificatif(s) termine.
+
+Resultat :
+- {s['exploites']} ticket(s) exploite(s)
+- {s['inexploites']} ticket(s) inexploitable(s)
+- Total debit : {s['total_debit']:.2f} EUR
+- Total credit : {s['total_credit']:.2f} EUR
+- Equilibre : {'OK' if s['equilibre'] else 'ERREUR'}
+
+Fichiers joints :
+{('- ' + files['excel']['name'] + ' (import Sage)') if files.get('excel') else ''}
+{('- ' + files['stamped_pdf']['name'] + ' (tickets vises S)') if files.get('stamped_pdf') else ''}
+{('- ' + files['inexploitable_pdf']['name'] + ' (a corriger)') if files.get('inexploitable_pdf') else ''}
+
+Cordialement,
+Agent Comptable IA"""
+
+                send_email_with_attachments(
+                    sender,
+                    f"Re: {subject} - Ecritures comptables traitees",
+                    body,
+                    attachments
+                )
+
+                print(f"Reponse envoyee a {sender}")
+
+            mail.logout()
+        except Exception as e:
+            print(f"Erreur email: {e}")
+
+        time.sleep(CHECK_INTERVAL)
 
 
 # ─── Routes Flask ────────────────────────────────────────────────
@@ -452,21 +586,21 @@ def index():
 @app.route('/api/process', methods=['POST'])
 def api_process():
     if 'files' not in request.files:
-        return jsonify({'error': 'Aucun fichier envoyé'}), 400
-    
+        return jsonify({'error': 'Aucun fichier envoye'}), 400
+
     files = request.files.getlist('files')
     if not files:
-        return jsonify({'error': 'Aucun fichier sélectionné'}), 400
-    
+        return jsonify({'error': 'Aucun fichier selectionne'}), 400
+
     files_data = []
     for f in files:
         if f.filename and f.filename.lower().endswith('.pdf'):
             pdf_bytes = f.read()
             files_data.append({'filename': f.filename, 'bytes': pdf_bytes})
-    
+
     if not files_data:
-        return jsonify({'error': 'Aucun fichier PDF trouvé'}), 400
-    
+        return jsonify({'error': 'Aucun fichier PDF trouve'}), 400
+
     try:
         results = process_tickets(files_data)
         return jsonify(results)
@@ -479,8 +613,16 @@ def download_file(filename):
     filepath = OUTPUT_FOLDER / filename
     if filepath.exists():
         return send_file(filepath, as_attachment=True, download_name=filename)
-    return jsonify({'error': 'Fichier non trouvé'}), 404
+    return jsonify({'error': 'Fichier non trouve'}), 404
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    if EMAIL_ADDRESS != 'ton-email@gmail.com':
+        email_thread = threading.Thread(target=check_emails, daemon=True)
+        email_thread.start()
+        print(f"Surveillance email activee pour {EMAIL_ADDRESS}")
+    else:
+        print("Email non configure - mode web uniquement")
+
+    print("Interface web sur http://localhost:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False)
