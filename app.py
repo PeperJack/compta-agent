@@ -1,6 +1,7 @@
 """
-Agent Comptable IA - MVP
+Agent Comptable IA - v3.0
 Traitement automatique de tickets de frais → écritures comptables Sage
+Multi-provider : Claude → OpenAI → Ollama (fallback)
 """
 
 import os
@@ -8,9 +9,11 @@ import io
 import json
 import base64
 import re
+import time
 import email
 import imaplib
 import smtplib
+import threading
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -26,27 +29,47 @@ from PyPDF2 import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import red, black
 from reportlab.lib.pagesizes import A4
-import fitz  # PyMuPDF for text extraction
+import fitz  # PyMuPDF
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
 
-# ─── Configuration ───────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', 'VOTRE_CLE_API_ICI')
+
+# ═══════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════
+
+# --- API Keys ---
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://localhost:11434')
+OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'qwen2.5vl:7b')
+
+# --- Retry & Rate Limiting ---
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2       # secondes, doublé à chaque retry
+RATE_LIMIT_DELAY = 1.5     # secondes entre chaque page traitée
+RATE_LIMIT_429_WAIT = 30   # secondes d'attente sur 429
+
+# --- Dossiers ---
 UPLOAD_FOLDER = Path('uploads')
 OUTPUT_FOLDER = Path('outputs')
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 OUTPUT_FOLDER.mkdir(exist_ok=True)
 
-# ─── Config Email (optionnel) ────────────────────────────────────
-EMAIL_ADDRESS = os.environ.get('EMAIL_ADDRESS', 'ton-email@gmail.com')
-EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD', 'ton-mot-de-passe-application')
+# --- Email (optionnel) ---
+EMAIL_ADDRESS = os.environ.get('EMAIL_ADDRESS', '')
+EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD', '')
 IMAP_SERVER = 'imap.gmail.com'
 SMTP_SERVER = 'smtp.gmail.com'
 SMTP_PORT = 465
 CHECK_INTERVAL = 30
 
-# ─── Prompt Comptable ────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════
+# PROMPT COMPTABLE
+# ═══════════════════════════════════════════════════════════════════
+
 SYSTEM_PROMPT = """Tu es un expert-comptable français spécialisé en Plan Comptable Général (PCG), fiscalité TVA et préparation de fichiers d'import pour Sage. Tu traites des tickets de frais professionnels.
 
 RÈGLES IMPÉRATIVES :
@@ -60,7 +83,7 @@ RÈGLES IMPÉRATIVES :
 8. Montants avec 2 décimales
 9. En cas de doute : signaler plutôt que deviner
 
-IMPORTANT : Une page peut contenir PLUSIEURS tickets côte à côte ou empilés. Analyse CHAQUE ticket séparément et produis une écriture par ticket.
+IMPORTANT : Une page peut contenir PLUSIEURS tickets. Analyse CHAQUE ticket séparément.
 
 RÈGLES TVA :
 - Péage, autoroute : TVA 20% → 100% déductible
@@ -100,6 +123,10 @@ Réponds UNIQUEMENT avec un JSON valide sans backticks ni texte autour :
 {"exploitable": true, "raison_non_exploitable": "", "ecritures": [{"date": "JJ/MM/AAAA", "reference": "T1", "journal": "FCB", "compte": "XXXXXXXX", "libelle": "Fournisseur - Nature de la dépense", "debit": 0.00, "credit": 0.00}]}"""
 
 
+# ═══════════════════════════════════════════════════════════════════
+# UTILITAIRES PDF
+# ═══════════════════════════════════════════════════════════════════
+
 def extract_text_from_pdf(pdf_bytes):
     """Extrait le texte d'un PDF avec PyMuPDF"""
     try:
@@ -117,43 +144,66 @@ def split_pdf_pages(pdf_bytes, filename):
     """Découpe un PDF en pages individuelles"""
     reader = PdfReader(io.BytesIO(pdf_bytes))
     pages = []
-
     for i, page in enumerate(reader.pages):
         writer = PdfWriter()
         writer.add_page(page)
         output = io.BytesIO()
         writer.write(output)
         output.seek(0)
-        page_bytes = output.read()
-
         page_name = f"{Path(filename).stem}_page{i+1}.pdf"
-        pages.append({'filename': page_name, 'bytes': page_bytes, 'original_filename': filename})
-
+        pages.append({
+            'filename': page_name,
+            'bytes': output.read(),
+            'original_filename': filename
+        })
     return pages
 
 
-def analyze_ticket_with_claude(pdf_bytes, filename="ticket.pdf"):
-    """Envoie un ticket à Claude pour analyse comptable"""
-    text = extract_text_from_pdf(pdf_bytes)
+def stamp_pdf_with_s(pdf_bytes):
+    """Ajoute un S rouge sur le PDF"""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter()
+    for page in reader.pages:
+        packet = io.BytesIO()
+        w = float(page.mediabox.width)
+        h = float(page.mediabox.height)
+        c = canvas.Canvas(packet, pagesize=(w, h))
+        c.setFont("Helvetica-Bold", 60)
+        c.setFillColor(red)
+        c.setFillAlpha(0.7)
+        c.drawString(w - 70, h - 70, "S")
+        c.save()
+        packet.seek(0)
+        overlay = PdfReader(packet)
+        page.merge_page(overlay.pages[0])
+        writer.add_page(page)
+    output = io.BytesIO()
+    writer.write(output)
+    output.seek(0)
+    return output.read()
 
-    if len(text.strip()) > 50:
-        user_content = f"Analyse ce ticket de frais et produis les écritures comptables :\n\n{text}"
-    else:
-        pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
-        user_content = [
-            {
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": pdf_b64
-                }
-            },
-            {
-                "type": "text",
-                "text": "Analyse ce ticket de frais et produis les écritures comptables. Une page peut contenir plusieurs tickets, traite-les tous séparément."
-            }
-        ]
+
+def merge_pdfs(pdf_list):
+    """Fusionne plusieurs PDFs en un seul"""
+    writer = PdfWriter()
+    for pdf_bytes in pdf_list:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            writer.add_page(page)
+    output = io.BytesIO()
+    writer.write(output)
+    output.seek(0)
+    return output.read()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PROVIDERS IA (Claude / OpenAI / Ollama)
+# ═══════════════════════════════════════════════════════════════════
+
+def call_anthropic(user_content):
+    """Appel Claude API"""
+    if not ANTHROPIC_API_KEY:
+        raise Exception("Anthropic: cle API non configuree")
 
     response = requests.post(
         'https://api.anthropic.com/v1/messages',
@@ -171,59 +221,234 @@ def analyze_ticket_with_claude(pdf_bytes, filename="ticket.pdf"):
         timeout=120
     )
 
-    if response.status_code != 200:
-        return {"exploitable": False, "raison_non_exploitable": f"Erreur API ({response.status_code})", "ecritures": []}
+    if response.status_code == 200:
+        return response.json()['content'][0]['text']
 
-    result_text = response.json()['content'][0]['text']
-    result_text = re.sub(r'```json\s*', '', result_text)
-    result_text = re.sub(r'```\s*', '', result_text).strip()
+    # Erreurs spécifiques pour le retry
+    error_msg = f"Anthropic HTTP {response.status_code}"
+    try:
+        error_detail = response.json().get('error', {}).get('message', '')
+        if error_detail:
+            error_msg += f" - {error_detail}"
+    except Exception:
+        pass
+
+    raise Exception(error_msg)
+
+
+def call_openai(user_content):
+    """Appel OpenAI GPT-4o (fallback 1)"""
+    if not OPENAI_API_KEY:
+        raise Exception("OpenAI: cle API non configuree")
+
+    # Convertir le format Anthropic → OpenAI
+    if isinstance(user_content, list):
+        messages_content = []
+        for item in user_content:
+            if item.get('type') == 'text':
+                messages_content.append({
+                    "type": "text",
+                    "text": item['text']
+                })
+            elif item.get('type') == 'document':
+                # OpenAI utilise image_url pour les docs vision
+                messages_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{item['source']['media_type']};base64,{item['source']['data']}"
+                    }
+                })
+    else:
+        messages_content = user_content
+
+    response = requests.post(
+        'https://api.openai.com/v1/chat/completions',
+        headers={
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {OPENAI_API_KEY}'
+        },
+        json={
+            'model': 'gpt-4o',
+            'max_tokens': 4000,
+            'messages': [
+                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'user', 'content': messages_content}
+            ]
+        },
+        timeout=120
+    )
+
+    if response.status_code == 200:
+        return response.json()['choices'][0]['message']['content']
+
+    raise Exception(f"OpenAI HTTP {response.status_code}")
+
+
+def call_ollama(text_content):
+    """Appel Ollama local (fallback 2 - texte uniquement)"""
+    if not text_content or not isinstance(text_content, str):
+        raise Exception("Ollama: pas de texte disponible pour analyse locale")
+
+    prompt = f"{SYSTEM_PROMPT}\n\nAnalyse ce ticket de frais et produis les ecritures comptables :\n\n{text_content}"
 
     try:
-        return json.loads(result_text)
-    except json.JSONDecodeError:
-        return {"exploitable": False, "raison_non_exploitable": "Réponse IA invalide", "ecritures": []}
+        response = requests.post(
+            f'{OLLAMA_URL}/api/generate',
+            json={
+                'model': OLLAMA_MODEL,
+                'prompt': prompt,
+                'stream': False,
+                'options': {
+                    'temperature': 0.1,
+                    'num_predict': 4000
+                }
+            },
+            timeout=180
+        )
+    except requests.exceptions.ConnectionError:
+        raise Exception("Ollama: serveur non accessible (est-il lance ?)")
+
+    if response.status_code == 200:
+        return response.json().get('response', '')
+
+    raise Exception(f"Ollama HTTP {response.status_code}")
 
 
-def stamp_pdf_with_s(pdf_bytes):
-    """Ajoute un 'S' rouge sur le PDF"""
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    writer = PdfWriter()
+# ═══════════════════════════════════════════════════════════════════
+# MOTEUR D'ANALYSE AVEC RETRY + FALLBACK
+# ═══════════════════════════════════════════════════════════════════
 
-    for page in reader.pages:
-        packet = io.BytesIO()
-        w = float(page.mediabox.width)
-        h = float(page.mediabox.height)
-        c = canvas.Canvas(packet, pagesize=(w, h))
-        c.setFont("Helvetica-Bold", 60)
-        c.setFillColor(red)
-        c.setFillAlpha(0.7)
-        c.drawString(w - 70, h - 70, "S")
-        c.save()
-        packet.seek(0)
+def clean_json_response(text):
+    """Nettoie et parse la réponse JSON d'un LLM"""
+    text = re.sub(r'```json\s*', '', text)
+    text = re.sub(r'```\s*', '', text).strip()
 
-        overlay = PdfReader(packet)
-        page.merge_page(overlay.pages[0])
-        writer.add_page(page)
+    # Chercher le JSON dans le texte si nécessaire
+    json_match = re.search(r'\{.*\}', text, re.DOTALL)
+    if json_match:
+        text = json_match.group()
 
-    output = io.BytesIO()
-    writer.write(output)
-    output.seek(0)
-    return output.read()
+    return json.loads(text)
 
 
-def merge_pdfs(pdf_list):
-    """Fusionne plusieurs PDFs en un seul"""
-    writer = PdfWriter()
-    for pdf_bytes in pdf_list:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        for page in reader.pages:
-            writer.add_page(page)
+def analyze_ticket_with_retry(pdf_bytes, filename="ticket.pdf"):
+    """
+    Analyse un ticket avec fallback multi-provider :
+    1. Claude Sonnet (meilleur pour la compta FR)
+    2. OpenAI GPT-4o (fallback cloud)
+    3. Ollama local (fallback offline, texte uniquement)
+    """
+    # Extraire le texte du PDF
+    text = extract_text_from_pdf(pdf_bytes)
+    has_text = len(text.strip()) > 50
 
-    output = io.BytesIO()
-    writer.write(output)
-    output.seek(0)
-    return output.read()
+    # Préparer le contenu pour les APIs cloud (texte ou vision)
+    if has_text:
+        cloud_content = f"Analyse ce ticket de frais et produis les ecritures comptables :\n\n{text}"
+    else:
+        pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
+        cloud_content = [
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": pdf_b64
+                }
+            },
+            {
+                "type": "text",
+                "text": "Analyse ce ticket de frais et produis les ecritures comptables. "
+                        "Une page peut contenir plusieurs tickets, traite-les tous separement."
+            }
+        ]
 
+    # Construire la chaîne de providers
+    providers = []
+
+    if ANTHROPIC_API_KEY:
+        providers.append(("Claude", lambda c=cloud_content: call_anthropic(c)))
+
+    if OPENAI_API_KEY:
+        providers.append(("OpenAI", lambda c=cloud_content: call_openai(c)))
+
+    if has_text:
+        providers.append(("Ollama", lambda t=text: call_ollama(t)))
+
+    if not providers:
+        return {
+            "exploitable": False,
+            "raison_non_exploitable": "Aucun provider IA configure (verifiez vos cles API)",
+            "ecritures": []
+        }
+
+    # Tenter chaque provider avec retry
+    last_error = ""
+
+    for provider_name, provider_fn in providers:
+        for attempt in range(MAX_RETRIES):
+            try:
+                print(f"  [{provider_name}] {filename} - tentative {attempt+1}/{MAX_RETRIES}")
+                raw_response = provider_fn()
+                result = clean_json_response(raw_response)
+
+                # Validation minimale du JSON
+                if 'exploitable' not in result:
+                    raise ValueError("JSON sans champ 'exploitable'")
+
+                print(f"  [{provider_name}] {filename} - OK")
+                return result
+
+            except json.JSONDecodeError as e:
+                last_error = f"{provider_name}: JSON invalide ({e})"
+                print(f"  [{provider_name}] JSON invalide, retry...")
+                time.sleep(RETRY_BASE_DELAY)
+
+            except ValueError as e:
+                last_error = f"{provider_name}: {e}"
+                print(f"  [{provider_name}] {e}, retry...")
+                time.sleep(RETRY_BASE_DELAY)
+
+            except Exception as e:
+                error_str = str(e)
+                last_error = f"{provider_name}: {error_str}"
+                print(f"  [{provider_name}] Erreur: {error_str}")
+
+                # 429 Rate limit → attendre longtemps puis retry
+                if '429' in error_str:
+                    wait = RATE_LIMIT_429_WAIT * (attempt + 1)
+                    print(f"  [{provider_name}] Rate limit 429, attente {wait}s...")
+                    time.sleep(wait)
+                    continue
+
+                # 529 Overloaded → retry rapide
+                if '529' in error_str:
+                    wait = RETRY_BASE_DELAY * (attempt + 1) * 2
+                    print(f"  [{provider_name}] Surcharge 529, attente {wait}s...")
+                    time.sleep(wait)
+                    continue
+
+                # 400 Bad Request → ne pas retry, passer au provider suivant
+                if '400' in error_str:
+                    print(f"  [{provider_name}] Erreur 400, passage au provider suivant")
+                    break
+
+                # Autre erreur → retry standard
+                time.sleep(RETRY_BASE_DELAY * (attempt + 1))
+
+        print(f"  [{provider_name}] Echec apres {MAX_RETRIES} tentatives")
+
+    # Tous les providers ont échoué
+    return {
+        "exploitable": False,
+        "raison_non_exploitable": f"Analyse impossible: {last_error}",
+        "ecritures": []
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GÉNÉRATION EXCEL SAGE
+# ═══════════════════════════════════════════════════════════════════
 
 def create_excel(all_ecritures, alerts=None):
     """Crée le fichier Excel format Sage"""
@@ -235,10 +460,8 @@ def create_excel(all_ecritures, alerts=None):
     header_fill = PatternFill(start_color='2C3E50', end_color='2C3E50', fill_type='solid')
     header_alignment = Alignment(horizontal='center', vertical='center')
     border = Border(
-        left=Side(style='thin'),
-        right=Side(style='thin'),
-        top=Side(style='thin'),
-        bottom=Side(style='thin')
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
     )
 
     headers = ['Date', 'Reference', 'Journal', 'Compte', 'Libelle', 'Debit', 'Credit']
@@ -276,10 +499,12 @@ def create_excel(all_ecritures, alerts=None):
                 cell.alignment = Alignment(horizontal='right')
         row += 1
 
+    # Ligne de contrôle
     row += 1
+    equilibre = abs(total_debit - total_credit) < 0.01
     ctrl_fill = PatternFill(
-        start_color='27AE60' if abs(total_debit - total_credit) < 0.01 else 'E74C3C',
-        end_color='27AE60' if abs(total_debit - total_credit) < 0.01 else 'E74C3C',
+        start_color='27AE60' if equilibre else 'E74C3C',
+        end_color='27AE60' if equilibre else 'E74C3C',
         fill_type='solid'
     )
     ctrl_font = Font(name='Calibri', bold=True, color='FFFFFF')
@@ -287,7 +512,7 @@ def create_excel(all_ecritures, alerts=None):
     ws.cell(row=row, column=4, value='CONTROLE').font = ctrl_font
     ws.cell(row=row, column=4).fill = ctrl_fill
 
-    status = 'OK - Equilibre' if abs(total_debit - total_credit) < 0.01 else 'ERREUR - Desequilibre'
+    status = 'OK - Equilibre' if equilibre else 'ERREUR - Desequilibre'
     ws.cell(row=row, column=5, value=status).font = ctrl_font
     ws.cell(row=row, column=5).fill = ctrl_fill
 
@@ -299,6 +524,7 @@ def create_excel(all_ecritures, alerts=None):
     ws.cell(row=row, column=7).fill = ctrl_fill
     ws.cell(row=row, column=7).number_format = '#,##0.00'
 
+    # Alertes
     if alerts:
         row += 2
         alert_font = Font(name='Calibri', bold=True, color='E74C3C')
@@ -307,19 +533,19 @@ def create_excel(all_ecritures, alerts=None):
             row += 1
             ws.cell(row=row, column=1, value=alert)
 
-    ws.column_dimensions['A'].width = 14
-    ws.column_dimensions['B'].width = 12
-    ws.column_dimensions['C'].width = 10
-    ws.column_dimensions['D'].width = 12
-    ws.column_dimensions['E'].width = 45
-    ws.column_dimensions['F'].width = 14
-    ws.column_dimensions['G'].width = 14
+    # Largeurs colonnes
+    for col_letter, width in [('A', 14), ('B', 12), ('C', 10), ('D', 12), ('E', 45), ('F', 14), ('G', 14)]:
+        ws.column_dimensions[col_letter].width = width
 
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
     return output.read()
 
+
+# ═══════════════════════════════════════════════════════════════════
+# RAPPORT INEXPLOITABLES
+# ═══════════════════════════════════════════════════════════════════
 
 def create_inexploitable_report(inexploitable_tickets):
     """Crée un PDF listant les tickets inexploitables"""
@@ -361,6 +587,10 @@ def create_inexploitable_report(inexploitable_tickets):
     return buffer.read()
 
 
+# ═══════════════════════════════════════════════════════════════════
+# TRAITEMENT PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════
+
 def process_tickets(files_data):
     """Traite une liste de tickets et retourne les résultats"""
     all_ecritures = []
@@ -370,40 +600,55 @@ def process_tickets(files_data):
     ticket_num = 1
     results_detail = []
 
-    # Découper les PDFs multi-pages en pages individuelles
+    # 1. Découper les PDFs multi-pages
     split_files = []
     for file_info in files_data:
-        reader = PdfReader(io.BytesIO(file_info['bytes']))
-        if len(reader.pages) > 1:
-            pages = split_pdf_pages(file_info['bytes'], file_info['filename'])
-            split_files.extend(pages)
-        else:
+        try:
+            reader = PdfReader(io.BytesIO(file_info['bytes']))
+            num_pages = len(reader.pages)
+            if num_pages > 1:
+                print(f"  Split {file_info['filename']} : {num_pages} pages")
+                pages = split_pdf_pages(file_info['bytes'], file_info['filename'])
+                split_files.extend(pages)
+            else:
+                split_files.append(file_info)
+        except Exception as e:
+            print(f"  Erreur split {file_info['filename']}: {e}")
             split_files.append(file_info)
 
-    for file_info in split_files:
+    total_pages = len(split_files)
+    print(f"\n{'='*50}")
+    print(f"Traitement de {total_pages} page(s) depuis {len(files_data)} fichier(s)")
+    print(f"{'='*50}\n")
+
+    # 2. Traiter chaque page
+    for idx, file_info in enumerate(split_files):
         filename = file_info['filename']
         pdf_bytes = file_info['bytes']
 
-        result = analyze_ticket_with_claude(pdf_bytes, filename)
+        print(f"\n[{idx+1}/{total_pages}] {filename}")
+        result = analyze_ticket_with_retry(pdf_bytes, filename)
 
         if result.get('exploitable'):
             ecritures = result.get('ecritures', [])
 
+            # Numérotation séquentielle
             for e in ecritures:
                 e['reference'] = f'T{ticket_num}'
                 e['debit'] = round(float(e.get('debit', 0) or 0), 2)
                 e['credit'] = round(float(e.get('credit', 0) or 0), 2)
 
+            # Vérification équilibre par ticket
             total_d = sum(e['debit'] for e in ecritures)
             total_c = sum(e['credit'] for e in ecritures)
             if abs(total_d - total_c) > 0.01:
-                alerts.append(f"T{ticket_num} ({filename}) : Desequilibre detecte ({total_d:.2f} != {total_c:.2f})")
+                alerts.append(f"T{ticket_num} ({filename}) : Desequilibre ({total_d:.2f} != {total_c:.2f})")
+                # Correction automatique sur la ligne banque
                 ligne_banque = next((e for e in ecritures if e['compte'] == '51200000'), None)
                 if ligne_banque:
                     ligne_banque['credit'] = round(total_d, 2)
 
             all_ecritures.extend(ecritures)
-
             stamped = stamp_pdf_with_s(pdf_bytes)
             exploited_pdfs.append(stamped)
 
@@ -413,7 +658,6 @@ def process_tickets(files_data):
                 'reference': f'T{ticket_num}',
                 'ecritures': ecritures
             })
-
             ticket_num += 1
         else:
             raison = result.get('raison_non_exploitable', 'Document inexploitable')
@@ -426,6 +670,11 @@ def process_tickets(files_data):
                 'raison': raison
             })
 
+        # Rate limiting entre chaque page (éviter 429)
+        if idx < total_pages - 1:
+            time.sleep(RATE_LIMIT_DELAY)
+
+    # 3. Génération des fichiers de sortie
     output_files = {}
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -450,25 +699,31 @@ def process_tickets(files_data):
         output_path.write_bytes(report)
         output_files['inexploitable_pdf'] = {'name': report_name, 'path': str(output_path)}
 
+    # Résumé console
+    total_d = round(sum(e['debit'] for e in all_ecritures), 2)
+    total_c = round(sum(e['credit'] for e in all_ecritures), 2)
+    print(f"\n{'='*50}")
+    print(f"RESULTAT : {len(exploited_pdfs)} exploites / {len(inexploitable_tickets)} inexploitables")
+    print(f"TOTAUX   : Debit={total_d} | Credit={total_c} | Equilibre={'OK' if abs(total_d - total_c) < 0.01 else 'ERREUR'}")
+    print(f"{'='*50}\n")
+
     return {
         'output_files': output_files,
         'results_detail': results_detail,
         'summary': {
-            'total': len(split_files),
+            'total': total_pages,
             'exploites': len(exploited_pdfs),
             'inexploites': len(inexploitable_tickets),
-            'total_debit': round(sum(e['debit'] for e in all_ecritures), 2),
-            'total_credit': round(sum(e['credit'] for e in all_ecritures), 2),
-            'equilibre': abs(sum(e['debit'] for e in all_ecritures) - sum(e['credit'] for e in all_ecritures)) < 0.01
+            'total_debit': total_d,
+            'total_credit': total_c,
+            'equilibre': abs(total_d - total_c) < 0.01
         }
     }
 
 
-# ─── Email Functions ─────────────────────────────────────────────
-
-import threading
-import time
-
+# ═══════════════════════════════════════════════════════════════════
+# EMAIL (optionnel)
+# ═══════════════════════════════════════════════════════════════════
 
 def send_email_with_attachments(to_email, subject, body, attachments):
     """Envoie un email avec pièces jointes"""
@@ -491,7 +746,7 @@ def send_email_with_attachments(to_email, subject, body, attachments):
 
 
 def check_emails():
-    """Vérifie les nouveaux emails et traite les PDFs"""
+    """Surveille les nouveaux emails et traite les PDFs"""
     while True:
         try:
             mail = imaplib.IMAP4_SSL(IMAP_SERVER)
@@ -506,7 +761,6 @@ def check_emails():
 
                 _, msg_data = mail.fetch(num, '(RFC822)')
                 msg = email.message_from_bytes(msg_data[0][1])
-
                 sender = email.utils.parseaddr(msg['From'])[1]
                 subject = msg['Subject'] or 'Sans objet'
 
@@ -521,24 +775,16 @@ def check_emails():
                 if not files_data:
                     continue
 
-                print(f"Mail de {sender} - {len(files_data)} PDF(s) a traiter")
-
+                print(f"\nMail de {sender} - {len(files_data)} PDF(s)")
                 results = process_tickets(files_data)
 
+                # Préparer les pièces jointes
                 attachments = []
                 files = results['output_files']
-
-                if files.get('excel'):
-                    with open(files['excel']['path'], 'rb') as f:
-                        attachments.append((files['excel']['name'], f.read()))
-
-                if files.get('stamped_pdf'):
-                    with open(files['stamped_pdf']['path'], 'rb') as f:
-                        attachments.append((files['stamped_pdf']['name'], f.read()))
-
-                if files.get('inexploitable_pdf'):
-                    with open(files['inexploitable_pdf']['path'], 'rb') as f:
-                        attachments.append((files['inexploitable_pdf']['name'], f.read()))
+                for key in ['excel', 'stamped_pdf', 'inexploitable_pdf']:
+                    if files.get(key):
+                        with open(files[key]['path'], 'rb') as f:
+                            attachments.append((files[key]['name'], f.read()))
 
                 s = results['summary']
                 body = f"""Bonjour,
@@ -552,11 +798,6 @@ Resultat :
 - Total credit : {s['total_credit']:.2f} EUR
 - Equilibre : {'OK' if s['equilibre'] else 'ERREUR'}
 
-Fichiers joints :
-{('- ' + files['excel']['name'] + ' (import Sage)') if files.get('excel') else ''}
-{('- ' + files['stamped_pdf']['name'] + ' (tickets vises S)') if files.get('stamped_pdf') else ''}
-{('- ' + files['inexploitable_pdf']['name'] + ' (a corriger)') if files.get('inexploitable_pdf') else ''}
-
 Cordialement,
 Agent Comptable IA"""
 
@@ -566,7 +807,6 @@ Agent Comptable IA"""
                     body,
                     attachments
                 )
-
                 print(f"Reponse envoyee a {sender}")
 
             mail.logout()
@@ -576,7 +816,9 @@ Agent Comptable IA"""
         time.sleep(CHECK_INTERVAL)
 
 
-# ─── Routes Flask ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ROUTES FLASK
+# ═══════════════════════════════════════════════════════════════════
 
 @app.route('/')
 def index():
@@ -616,13 +858,56 @@ def download_file(filename):
     return jsonify({'error': 'Fichier non trouve'}), 404
 
 
+@app.route('/api/status')
+def api_status():
+    """Endpoint pour vérifier quels providers sont configurés"""
+    providers = {
+        'anthropic': bool(ANTHROPIC_API_KEY),
+        'openai': bool(OPENAI_API_KEY),
+        'ollama': False
+    }
+    # Test rapide Ollama
+    try:
+        r = requests.get(f'{OLLAMA_URL}/api/tags', timeout=3)
+        providers['ollama'] = r.status_code == 200
+    except Exception:
+        pass
+
+    return jsonify({
+        'providers': providers,
+        'active_providers': sum(1 for v in providers.values() if v),
+        'ollama_model': OLLAMA_MODEL
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DÉMARRAGE
+# ═══════════════════════════════════════════════════════════════════
+
 if __name__ == '__main__':
-    if EMAIL_ADDRESS != 'ton-email@gmail.com':
+    print("\n" + "="*50)
+    print("  AGENT COMPTABLE IA v3.0")
+    print("="*50)
+
+    # Afficher les providers actifs
+    print("\nProviders configures :")
+    print(f"  Claude  : {'OK' if ANTHROPIC_API_KEY else 'NON (ANTHROPIC_API_KEY manquant)'}")
+    print(f"  OpenAI  : {'OK' if OPENAI_API_KEY else 'NON (OPENAI_API_KEY manquant)'}")
+    try:
+        r = requests.get(f'{OLLAMA_URL}/api/tags', timeout=3)
+        print(f"  Ollama  : {'OK - ' + OLLAMA_MODEL if r.status_code == 200 else 'NON'}")
+    except Exception:
+        print(f"  Ollama  : NON (serveur non accessible sur {OLLAMA_URL})")
+
+    # Mode email
+    if EMAIL_ADDRESS and EMAIL_PASSWORD:
         email_thread = threading.Thread(target=check_emails, daemon=True)
         email_thread.start()
-        print(f"Surveillance email activee pour {EMAIL_ADDRESS}")
+        print(f"\nEmail : surveillance activee ({EMAIL_ADDRESS})")
     else:
-        print("Email non configure - mode web uniquement")
+        print("\nEmail : non configure")
 
-    print("Interface web sur http://localhost:5000")
+    print(f"\nInterface web : http://localhost:5000")
+    print("="*50 + "\n")
+
     app.run(host='0.0.0.0', port=5000, debug=False)
