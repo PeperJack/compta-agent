@@ -1,7 +1,8 @@
 """
-Agent Comptable IA - v3.0
+Agent Comptable IA - v4.0 SECURE
 Traitement automatique de tickets de frais → écritures comptables Sage
 Multi-provider : Claude → OpenAI → Ollama (fallback)
+Sécurité : Auth, CSRF, Zero Data Retention, Anti-injection, Headers
 """
 
 import os
@@ -14,15 +15,23 @@ import email
 import imaplib
 import smtplib
 import threading
+import secrets
+import hashlib
+import hmac
+from functools import wraps
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
-from flask import Flask, request, jsonify, render_template, send_file
+from flask import (
+    Flask, request, jsonify, render_template, send_file,
+    session, redirect, url_for, abort, make_response,
+    after_this_request
+)
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from PyPDF2 import PdfReader, PdfWriter
@@ -32,30 +41,48 @@ from reportlab.lib.pagesizes import A4
 import fitz  # PyMuPDF
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
 
 
 # ═══════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════
 
+# --- Sécurité ---
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('FORCE_HTTPS', 'false').lower() == 'true'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=2)
+
+# --- Identifiants login (via env, JAMAIS en dur) ---
+APP_USERNAME = os.environ.get('APP_USERNAME', 'admin')
+APP_PASSWORD_HASH = os.environ.get('APP_PASSWORD_HASH', '')
+APP_PASSWORD_PLAIN = os.environ.get('APP_PASSWORD', 'changeme')
+
 # --- API Keys ---
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://localhost:11434')
-OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'qwen2.5vl:7b')
+OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'qwen3-vl')
 
 # --- Retry & Rate Limiting ---
 MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2       # secondes, doublé à chaque retry
-RATE_LIMIT_DELAY = 1.5     # secondes entre chaque page traitée
-RATE_LIMIT_429_WAIT = 30   # secondes d'attente sur 429
+RETRY_BASE_DELAY = 2
+RATE_LIMIT_DELAY = 1.5
+RATE_LIMIT_429_WAIT = 30
 
-# --- Dossiers ---
-UPLOAD_FOLDER = Path('uploads')
+# --- Brute-force protection ---
+LOGIN_ATTEMPTS = {}
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_DURATION = 300  # 5 minutes
+
+# --- Dossiers (temporaires, nettoyés après usage) ---
 OUTPUT_FOLDER = Path('outputs')
-UPLOAD_FOLDER.mkdir(exist_ok=True)
 OUTPUT_FOLDER.mkdir(exist_ok=True)
+
+# --- Auto-delete : supprimer les fichiers de plus de X minutes ---
+FILE_RETENTION_MINUTES = int(os.environ.get('FILE_RETENTION_MINUTES', '10'))
 
 # --- Email (optionnel) ---
 EMAIL_ADDRESS = os.environ.get('EMAIL_ADDRESS', '')
@@ -64,6 +91,160 @@ IMAP_SERVER = 'imap.gmail.com'
 SMTP_SERVER = 'smtp.gmail.com'
 SMTP_PORT = 465
 CHECK_INTERVAL = 30
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SÉCURITÉ : HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
+def hash_password(password):
+    """Hash un mot de passe avec SHA-256 + salt"""
+    salt = secrets.token_hex(16)
+    h = hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
+    return f"{salt}:{h}"
+
+
+def verify_password(password, stored_hash):
+    """Vérifie un mot de passe contre son hash"""
+    if ':' not in stored_hash:
+        return False
+    salt, h = stored_hash.split(':', 1)
+    return hmac.compare_digest(
+        hashlib.sha256(f"{salt}{password}".encode()).hexdigest(),
+        h
+    )
+
+
+def check_password(password):
+    """Vérifie le mot de passe (hash ou plain selon config)"""
+    if APP_PASSWORD_HASH:
+        return verify_password(password, APP_PASSWORD_HASH)
+    return hmac.compare_digest(password, APP_PASSWORD_PLAIN)
+
+
+def is_locked_out(ip):
+    """Vérifie si une IP est bloquée pour trop de tentatives"""
+    if ip in LOGIN_ATTEMPTS:
+        attempts, lockout_time = LOGIN_ATTEMPTS[ip]
+        if lockout_time and datetime.now() < lockout_time:
+            return True
+        if lockout_time and datetime.now() >= lockout_time:
+            del LOGIN_ATTEMPTS[ip]
+            return False
+    return False
+
+
+def record_failed_attempt(ip):
+    """Enregistre une tentative de login échouée"""
+    if ip not in LOGIN_ATTEMPTS:
+        LOGIN_ATTEMPTS[ip] = [0, None]
+    LOGIN_ATTEMPTS[ip][0] += 1
+    if LOGIN_ATTEMPTS[ip][0] >= MAX_LOGIN_ATTEMPTS:
+        LOGIN_ATTEMPTS[ip][1] = datetime.now() + timedelta(seconds=LOCKOUT_DURATION)
+
+
+def clear_attempts(ip):
+    """Reset les tentatives après un login réussi"""
+    if ip in LOGIN_ATTEMPTS:
+        del LOGIN_ATTEMPTS[ip]
+
+
+def login_required(f):
+    """Décorateur pour protéger les routes"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get('authenticated'):
+            if request.is_json or request.path.startswith('/api/'):
+                return jsonify({'error': 'Non authentifie'}), 401
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated
+
+
+def generate_csrf_token():
+    """Génère un token CSRF"""
+    if 'csrf_token' not in session:
+        session['csrf_token'] = secrets.token_hex(32)
+    return session['csrf_token']
+
+
+def validate_csrf(token):
+    """Valide le token CSRF"""
+    return hmac.compare_digest(
+        token or '',
+        session.get('csrf_token', '')
+    )
+
+
+def sanitize_filename(filename):
+    """Nettoie un nom de fichier contre les injections path traversal"""
+    filename = os.path.basename(filename)
+    filename = re.sub(r'[^\w\s\-\.]', '', filename)
+    filename = filename.strip('. ')
+    if not filename:
+        filename = 'document.pdf'
+    return filename
+
+
+def cleanup_old_files():
+    """Supprime les fichiers de sortie de plus de FILE_RETENTION_MINUTES"""
+    try:
+        cutoff = datetime.now() - timedelta(minutes=FILE_RETENTION_MINUTES)
+        for f in OUTPUT_FOLDER.iterdir():
+            if f.is_file():
+                mtime = datetime.fromtimestamp(f.stat().st_mtime)
+                if mtime < cutoff:
+                    f.unlink()
+                    print(f"  [Cleanup] Supprime {f.name}")
+    except Exception as e:
+        print(f"  [Cleanup] Erreur: {e}")
+
+
+def schedule_cleanup():
+    """Lance le nettoyage automatique toutes les 5 minutes"""
+    while True:
+        time.sleep(300)
+        cleanup_old_files()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SÉCURITÉ : MIDDLEWARE
+# ═══════════════════════════════════════════════════════════════════
+
+@app.before_request
+def security_checks():
+    """Vérifications de sécurité avant chaque requête"""
+    # CSRF sur les POST (sauf login et API avec session)
+    if request.method == 'POST' and request.path != '/login':
+        if session.get('authenticated'):
+            token = (request.form.get('csrf_token') or
+                     request.headers.get('X-CSRF-Token') or
+                     '')
+            if not validate_csrf(token):
+                abort(403)
+
+
+@app.after_request
+def security_headers(response):
+    """Headers de sécurité sur toutes les réponses"""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "img-src 'self' data:; "
+        "connect-src 'self'"
+    )
+    # Pas de cache sur les fichiers sensibles
+    if request.path.startswith('/api/download'):
+        response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -197,7 +378,7 @@ def merge_pdfs(pdf_list):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PROVIDERS IA (Claude / OpenAI / Ollama)
+# PROVIDERS IA
 # ═══════════════════════════════════════════════════════════════════
 
 def call_anthropic(user_content):
@@ -224,7 +405,6 @@ def call_anthropic(user_content):
     if response.status_code == 200:
         return response.json()['content'][0]['text']
 
-    # Erreurs spécifiques pour le retry
     error_msg = f"Anthropic HTTP {response.status_code}"
     try:
         error_detail = response.json().get('error', {}).get('message', '')
@@ -232,7 +412,6 @@ def call_anthropic(user_content):
             error_msg += f" - {error_detail}"
     except Exception:
         pass
-
     raise Exception(error_msg)
 
 
@@ -241,17 +420,12 @@ def call_openai(user_content):
     if not OPENAI_API_KEY:
         raise Exception("OpenAI: cle API non configuree")
 
-    # Convertir le format Anthropic → OpenAI
     if isinstance(user_content, list):
         messages_content = []
         for item in user_content:
             if item.get('type') == 'text':
-                messages_content.append({
-                    "type": "text",
-                    "text": item['text']
-                })
+                messages_content.append({"type": "text", "text": item['text']})
             elif item.get('type') == 'document':
-                # OpenAI utilise image_url pour les docs vision
                 messages_content.append({
                     "type": "image_url",
                     "image_url": {
@@ -280,16 +454,15 @@ def call_openai(user_content):
 
     if response.status_code == 200:
         return response.json()['choices'][0]['message']['content']
-
     raise Exception(f"OpenAI HTTP {response.status_code}")
 
 
 def call_ollama(text_content):
     """Appel Ollama local (fallback 2 - texte uniquement)"""
     if not text_content or not isinstance(text_content, str):
-        raise Exception("Ollama: pas de texte disponible pour analyse locale")
+        raise Exception("Ollama: pas de texte disponible")
 
-    prompt = f"{SYSTEM_PROMPT}\n\nAnalyse ce ticket de frais et produis les ecritures comptables :\n\n{text_content}"
+    prompt = f"{SYSTEM_PROMPT}\n\nAnalyse ce ticket de frais :\n\n{text_content}"
 
     try:
         response = requests.post(
@@ -298,19 +471,15 @@ def call_ollama(text_content):
                 'model': OLLAMA_MODEL,
                 'prompt': prompt,
                 'stream': False,
-                'options': {
-                    'temperature': 0.1,
-                    'num_predict': 4000
-                }
+                'options': {'temperature': 0.1, 'num_predict': 4000}
             },
             timeout=180
         )
     except requests.exceptions.ConnectionError:
-        raise Exception("Ollama: serveur non accessible (est-il lance ?)")
+        raise Exception("Ollama: serveur non accessible")
 
     if response.status_code == 200:
         return response.json().get('response', '')
-
     raise Exception(f"Ollama HTTP {response.status_code}")
 
 
@@ -319,30 +488,20 @@ def call_ollama(text_content):
 # ═══════════════════════════════════════════════════════════════════
 
 def clean_json_response(text):
-    """Nettoie et parse la réponse JSON d'un LLM"""
+    """Nettoie et parse la réponse JSON"""
     text = re.sub(r'```json\s*', '', text)
     text = re.sub(r'```\s*', '', text).strip()
-
-    # Chercher le JSON dans le texte si nécessaire
     json_match = re.search(r'\{.*\}', text, re.DOTALL)
     if json_match:
         text = json_match.group()
-
     return json.loads(text)
 
 
 def analyze_ticket_with_retry(pdf_bytes, filename="ticket.pdf"):
-    """
-    Analyse un ticket avec fallback multi-provider :
-    1. Claude Sonnet (meilleur pour la compta FR)
-    2. OpenAI GPT-4o (fallback cloud)
-    3. Ollama local (fallback offline, texte uniquement)
-    """
-    # Extraire le texte du PDF
+    """Analyse avec fallback : Claude → OpenAI → Ollama"""
     text = extract_text_from_pdf(pdf_bytes)
     has_text = len(text.strip()) > 50
 
-    # Préparer le contenu pour les APIs cloud (texte ou vision)
     if has_text:
         cloud_content = f"Analyse ce ticket de frais et produis les ecritures comptables :\n\n{text}"
     else:
@@ -363,39 +522,30 @@ def analyze_ticket_with_retry(pdf_bytes, filename="ticket.pdf"):
             }
         ]
 
-    # Construire la chaîne de providers
     providers = []
-
     if ANTHROPIC_API_KEY:
         providers.append(("Claude", lambda c=cloud_content: call_anthropic(c)))
-
     if OPENAI_API_KEY:
         providers.append(("OpenAI", lambda c=cloud_content: call_openai(c)))
-
     if has_text:
         providers.append(("Ollama", lambda t=text: call_ollama(t)))
 
     if not providers:
         return {
             "exploitable": False,
-            "raison_non_exploitable": "Aucun provider IA configure (verifiez vos cles API)",
+            "raison_non_exploitable": "Aucun provider IA configure",
             "ecritures": []
         }
 
-    # Tenter chaque provider avec retry
     last_error = ""
-
     for provider_name, provider_fn in providers:
         for attempt in range(MAX_RETRIES):
             try:
                 print(f"  [{provider_name}] {filename} - tentative {attempt+1}/{MAX_RETRIES}")
                 raw_response = provider_fn()
                 result = clean_json_response(raw_response)
-
-                # Validation minimale du JSON
                 if 'exploitable' not in result:
                     raise ValueError("JSON sans champ 'exploitable'")
-
                 print(f"  [{provider_name}] {filename} - OK")
                 return result
 
@@ -414,31 +564,23 @@ def analyze_ticket_with_retry(pdf_bytes, filename="ticket.pdf"):
                 last_error = f"{provider_name}: {error_str}"
                 print(f"  [{provider_name}] Erreur: {error_str}")
 
-                # 429 Rate limit → attendre longtemps puis retry
                 if '429' in error_str:
                     wait = RATE_LIMIT_429_WAIT * (attempt + 1)
                     print(f"  [{provider_name}] Rate limit 429, attente {wait}s...")
                     time.sleep(wait)
                     continue
-
-                # 529 Overloaded → retry rapide
                 if '529' in error_str:
                     wait = RETRY_BASE_DELAY * (attempt + 1) * 2
                     print(f"  [{provider_name}] Surcharge 529, attente {wait}s...")
                     time.sleep(wait)
                     continue
-
-                # 400 Bad Request → ne pas retry, passer au provider suivant
                 if '400' in error_str:
-                    print(f"  [{provider_name}] Erreur 400, passage au provider suivant")
+                    print(f"  [{provider_name}] Erreur 400, provider suivant")
                     break
-
-                # Autre erreur → retry standard
                 time.sleep(RETRY_BASE_DELAY * (attempt + 1))
 
         print(f"  [{provider_name}] Echec apres {MAX_RETRIES} tentatives")
 
-    # Tous les providers ont échoué
     return {
         "exploitable": False,
         "raison_non_exploitable": f"Analyse impossible: {last_error}",
@@ -499,7 +641,6 @@ def create_excel(all_ecritures, alerts=None):
                 cell.alignment = Alignment(horizontal='right')
         row += 1
 
-    # Ligne de contrôle
     row += 1
     equilibre = abs(total_debit - total_credit) < 0.01
     ctrl_fill = PatternFill(
@@ -511,20 +652,16 @@ def create_excel(all_ecritures, alerts=None):
 
     ws.cell(row=row, column=4, value='CONTROLE').font = ctrl_font
     ws.cell(row=row, column=4).fill = ctrl_fill
-
     status = 'OK - Equilibre' if equilibre else 'ERREUR - Desequilibre'
     ws.cell(row=row, column=5, value=status).font = ctrl_font
     ws.cell(row=row, column=5).fill = ctrl_fill
-
     ws.cell(row=row, column=6, value=round(total_debit, 2)).font = ctrl_font
     ws.cell(row=row, column=6).fill = ctrl_fill
     ws.cell(row=row, column=6).number_format = '#,##0.00'
-
     ws.cell(row=row, column=7, value=round(total_credit, 2)).font = ctrl_font
     ws.cell(row=row, column=7).fill = ctrl_fill
     ws.cell(row=row, column=7).number_format = '#,##0.00'
 
-    # Alertes
     if alerts:
         row += 2
         alert_font = Font(name='Calibri', bold=True, color='E74C3C')
@@ -533,7 +670,6 @@ def create_excel(all_ecritures, alerts=None):
             row += 1
             ws.cell(row=row, column=1, value=alert)
 
-    # Largeurs colonnes
     for col_letter, width in [('A', 14), ('B', 12), ('C', 10), ('D', 12), ('E', 45), ('F', 14), ('G', 14)]:
         ws.column_dimensions[col_letter].width = width
 
@@ -556,14 +692,12 @@ def create_inexploitable_report(inexploitable_tickets):
     c.setFont("Helvetica-Bold", 18)
     c.setFillColor(red)
     c.drawString(50, height - 60, "Justificatifs inexploitables")
-
     c.setFont("Helvetica", 11)
     c.setFillColor(black)
     c.drawString(50, height - 85, f"Date de traitement : {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-
     c.setFont("Helvetica", 10)
-    c.drawString(50, height - 110, "Les documents suivants n'ont pas pu etre exploites pour la saisie comptable.")
-    c.drawString(50, height - 125, "Merci de fournir des justificatifs conformes (facture detaillee avec HT, TVA et TTC).")
+    c.drawString(50, height - 110, "Les documents suivants n'ont pas pu etre exploites.")
+    c.drawString(50, height - 125, "Merci de fournir des justificatifs conformes.")
 
     y = height - 165
     c.setFont("Helvetica-Bold", 11)
@@ -592,7 +726,7 @@ def create_inexploitable_report(inexploitable_tickets):
 # ═══════════════════════════════════════════════════════════════════
 
 def process_tickets(files_data):
-    """Traite une liste de tickets et retourne les résultats"""
+    """Traite une liste de tickets"""
     all_ecritures = []
     exploited_pdfs = []
     inexploitable_tickets = []
@@ -600,14 +734,13 @@ def process_tickets(files_data):
     ticket_num = 1
     results_detail = []
 
-    # 1. Découper les PDFs multi-pages
+    # Split multi-pages
     split_files = []
     for file_info in files_data:
         try:
             reader = PdfReader(io.BytesIO(file_info['bytes']))
-            num_pages = len(reader.pages)
-            if num_pages > 1:
-                print(f"  Split {file_info['filename']} : {num_pages} pages")
+            if len(reader.pages) > 1:
+                print(f"  Split {file_info['filename']} : {len(reader.pages)} pages")
                 pages = split_pdf_pages(file_info['bytes'], file_info['filename'])
                 split_files.extend(pages)
             else:
@@ -618,10 +751,9 @@ def process_tickets(files_data):
 
     total_pages = len(split_files)
     print(f"\n{'='*50}")
-    print(f"Traitement de {total_pages} page(s) depuis {len(files_data)} fichier(s)")
+    print(f"Traitement de {total_pages} page(s)")
     print(f"{'='*50}\n")
 
-    # 2. Traiter chaque page
     for idx, file_info in enumerate(split_files):
         filename = file_info['filename']
         pdf_bytes = file_info['bytes']
@@ -631,19 +763,15 @@ def process_tickets(files_data):
 
         if result.get('exploitable'):
             ecritures = result.get('ecritures', [])
-
-            # Numérotation séquentielle
             for e in ecritures:
                 e['reference'] = f'T{ticket_num}'
                 e['debit'] = round(float(e.get('debit', 0) or 0), 2)
                 e['credit'] = round(float(e.get('credit', 0) or 0), 2)
 
-            # Vérification équilibre par ticket
             total_d = sum(e['debit'] for e in ecritures)
             total_c = sum(e['credit'] for e in ecritures)
             if abs(total_d - total_c) > 0.01:
                 alerts.append(f"T{ticket_num} ({filename}) : Desequilibre ({total_d:.2f} != {total_c:.2f})")
-                # Correction automatique sur la ligne banque
                 ligne_banque = next((e for e in ecritures if e['compte'] == '51200000'), None)
                 if ligne_banque:
                     ligne_banque['credit'] = round(total_d, 2)
@@ -651,60 +779,49 @@ def process_tickets(files_data):
             all_ecritures.extend(ecritures)
             stamped = stamp_pdf_with_s(pdf_bytes)
             exploited_pdfs.append(stamped)
-
             results_detail.append({
-                'filename': filename,
-                'status': 'exploitable',
-                'reference': f'T{ticket_num}',
-                'ecritures': ecritures
+                'filename': filename, 'status': 'exploitable',
+                'reference': f'T{ticket_num}', 'ecritures': ecritures
             })
             ticket_num += 1
         else:
             raison = result.get('raison_non_exploitable', 'Document inexploitable')
             inexploitable_tickets.append({'filename': filename, 'raison': raison})
             alerts.append(f"!! {filename} : {raison}")
-
             results_detail.append({
-                'filename': filename,
-                'status': 'inexploitable',
-                'raison': raison
+                'filename': filename, 'status': 'inexploitable', 'raison': raison
             })
 
-        # Rate limiting entre chaque page (éviter 429)
         if idx < total_pages - 1:
             time.sleep(RATE_LIMIT_DELAY)
 
-    # 3. Génération des fichiers de sortie
+    # Génération fichiers (supprimés automatiquement après FILE_RETENTION_MINUTES)
     output_files = {}
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
     if all_ecritures:
         excel_bytes = create_excel(all_ecritures, alerts if alerts else None)
         excel_name = f'Sage_import_{timestamp}.xlsx'
-        output_path = OUTPUT_FOLDER / excel_name
-        output_path.write_bytes(excel_bytes)
-        output_files['excel'] = {'name': excel_name, 'path': str(output_path)}
+        (OUTPUT_FOLDER / excel_name).write_bytes(excel_bytes)
+        output_files['excel'] = {'name': excel_name, 'path': str(OUTPUT_FOLDER / excel_name)}
 
     if exploited_pdfs:
-        merged_stamped = merge_pdfs(exploited_pdfs)
+        merged = merge_pdfs(exploited_pdfs)
         stamped_name = f'Tickets_exploites_S_{timestamp}.pdf'
-        output_path = OUTPUT_FOLDER / stamped_name
-        output_path.write_bytes(merged_stamped)
-        output_files['stamped_pdf'] = {'name': stamped_name, 'path': str(output_path)}
+        (OUTPUT_FOLDER / stamped_name).write_bytes(merged)
+        output_files['stamped_pdf'] = {'name': stamped_name, 'path': str(OUTPUT_FOLDER / stamped_name)}
 
     if inexploitable_tickets:
         report = create_inexploitable_report(inexploitable_tickets)
         report_name = f'Justificatifs_inexploites_{timestamp}.pdf'
-        output_path = OUTPUT_FOLDER / report_name
-        output_path.write_bytes(report)
-        output_files['inexploitable_pdf'] = {'name': report_name, 'path': str(output_path)}
+        (OUTPUT_FOLDER / report_name).write_bytes(report)
+        output_files['inexploitable_pdf'] = {'name': report_name, 'path': str(OUTPUT_FOLDER / report_name)}
 
-    # Résumé console
     total_d = round(sum(e['debit'] for e in all_ecritures), 2)
     total_c = round(sum(e['credit'] for e in all_ecritures), 2)
     print(f"\n{'='*50}")
     print(f"RESULTAT : {len(exploited_pdfs)} exploites / {len(inexploitable_tickets)} inexploitables")
-    print(f"TOTAUX   : Debit={total_d} | Credit={total_c} | Equilibre={'OK' if abs(total_d - total_c) < 0.01 else 'ERREUR'}")
+    print(f"TOTAUX   : D={total_d} | C={total_c} | {'OK' if abs(total_d - total_c) < 0.01 else 'ERREUR'}")
     print(f"{'='*50}\n")
 
     return {
@@ -726,44 +843,36 @@ def process_tickets(files_data):
 # ═══════════════════════════════════════════════════════════════════
 
 def send_email_with_attachments(to_email, subject, body, attachments):
-    """Envoie un email avec pièces jointes"""
     msg = MIMEMultipart()
     msg['From'] = EMAIL_ADDRESS
     msg['To'] = to_email
     msg['Subject'] = subject
     msg.attach(MIMEText(body, 'plain'))
-
     for att_filename, file_bytes in attachments:
         part = MIMEBase('application', 'octet-stream')
         part.set_payload(file_bytes)
         encoders.encode_base64(part)
         part.add_header('Content-Disposition', f'attachment; filename="{att_filename}"')
         msg.attach(part)
-
     with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
         server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         server.send_message(msg)
 
 
 def check_emails():
-    """Surveille les nouveaux emails et traite les PDFs"""
     while True:
         try:
             mail = imaplib.IMAP4_SSL(IMAP_SERVER)
             mail.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             mail.select('INBOX')
-
             _, messages = mail.search(None, 'UNSEEN')
-
             for num in messages[0].split():
                 if not num:
                     continue
-
                 _, msg_data = mail.fetch(num, '(RFC822)')
                 msg = email.message_from_bytes(msg_data[0][1])
                 sender = email.utils.parseaddr(msg['From'])[1]
                 subject = msg['Subject'] or 'Sans objet'
-
                 files_data = []
                 for part in msg.walk():
                     if part.get_content_type() == 'application/pdf':
@@ -771,61 +880,84 @@ def check_emails():
                         pdf_bytes = part.get_payload(decode=True)
                         if pdf_bytes:
                             files_data.append({'filename': att_filename, 'bytes': pdf_bytes})
-
                 if not files_data:
                     continue
-
                 print(f"\nMail de {sender} - {len(files_data)} PDF(s)")
                 results = process_tickets(files_data)
-
-                # Préparer les pièces jointes
                 attachments = []
                 files = results['output_files']
                 for key in ['excel', 'stamped_pdf', 'inexploitable_pdf']:
                     if files.get(key):
                         with open(files[key]['path'], 'rb') as f:
                             attachments.append((files[key]['name'], f.read()))
-
                 s = results['summary']
                 body = f"""Bonjour,
 
-Traitement automatique de vos {s['total']} justificatif(s) termine.
+Traitement de vos {s['total']} justificatif(s) termine.
 
-Resultat :
-- {s['exploites']} ticket(s) exploite(s)
-- {s['inexploites']} ticket(s) inexploitable(s)
-- Total debit : {s['total_debit']:.2f} EUR
-- Total credit : {s['total_credit']:.2f} EUR
+- {s['exploites']} exploite(s)
+- {s['inexploites']} inexploitable(s)
+- Debit : {s['total_debit']:.2f} EUR
+- Credit : {s['total_credit']:.2f} EUR
 - Equilibre : {'OK' if s['equilibre'] else 'ERREUR'}
 
-Cordialement,
 Agent Comptable IA"""
-
-                send_email_with_attachments(
-                    sender,
-                    f"Re: {subject} - Ecritures comptables traitees",
-                    body,
-                    attachments
-                )
+                send_email_with_attachments(sender, f"Re: {subject}", body, attachments)
                 print(f"Reponse envoyee a {sender}")
-
             mail.logout()
         except Exception as e:
             print(f"Erreur email: {e}")
-
         time.sleep(CHECK_INTERVAL)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ROUTES FLASK
+# ROUTES
 # ═══════════════════════════════════════════════════════════════════
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        ip = request.remote_addr
+
+        if is_locked_out(ip):
+            error = "Trop de tentatives. Reessayez dans 5 minutes."
+        else:
+            username = request.form.get('username', '').strip()
+            password = request.form.get('password', '')
+
+            if username == APP_USERNAME and check_password(password):
+                session.permanent = True
+                session['authenticated'] = True
+                session['login_time'] = datetime.now().isoformat()
+                session['csrf_token'] = secrets.token_hex(32)
+                clear_attempts(ip)
+                return redirect(url_for('index'))
+            else:
+                record_failed_attempt(ip)
+                remaining = MAX_LOGIN_ATTEMPTS - LOGIN_ATTEMPTS.get(ip, [0])[0]
+                if remaining > 0:
+                    error = f"Identifiants incorrects. {remaining} tentative(s) restante(s)."
+                else:
+                    error = "Compte bloque pour 5 minutes."
+
+    return render_template('login.html', error=error)
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+
 @app.route('/')
+@login_required
 def index():
-    return render_template('index.html')
+    return render_template('index.html', csrf_token=generate_csrf_token())
 
 
 @app.route('/api/process', methods=['POST'])
+@login_required
 def api_process():
     if 'files' not in request.files:
         return jsonify({'error': 'Aucun fichier envoye'}), 400
@@ -837,36 +969,68 @@ def api_process():
     files_data = []
     for f in files:
         if f.filename and f.filename.lower().endswith('.pdf'):
+            safe_name = sanitize_filename(f.filename)
             pdf_bytes = f.read()
-            files_data.append({'filename': f.filename, 'bytes': pdf_bytes})
+
+            # Validation : vérifier que c'est bien un PDF
+            if not pdf_bytes[:5] == b'%PDF-':
+                continue
+
+            files_data.append({'filename': safe_name, 'bytes': pdf_bytes})
 
     if not files_data:
-        return jsonify({'error': 'Aucun fichier PDF trouve'}), 400
+        return jsonify({'error': 'Aucun fichier PDF valide'}), 400
 
     try:
         results = process_tickets(files_data)
+
+        # Nettoyage immédiat des données en mémoire
+        for fd in files_data:
+            fd['bytes'] = None
+        files_data.clear()
+
         return jsonify(results)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/download/<filename>')
+@login_required
 def download_file(filename):
-    filepath = OUTPUT_FOLDER / filename
-    if filepath.exists():
-        return send_file(filepath, as_attachment=True, download_name=filename)
-    return jsonify({'error': 'Fichier non trouve'}), 404
+    # Anti path-traversal
+    safe_name = sanitize_filename(filename)
+    filepath = OUTPUT_FOLDER / safe_name
+
+    if not filepath.exists():
+        return jsonify({'error': 'Fichier non trouve'}), 404
+
+    # Vérifier que le fichier est bien dans OUTPUT_FOLDER
+    try:
+        filepath.resolve().relative_to(OUTPUT_FOLDER.resolve())
+    except ValueError:
+        abort(403)
+
+    @after_this_request
+    def remove_file(response):
+        """Supprime le fichier après envoi"""
+        try:
+            filepath.unlink()
+            print(f"  [ZDR] Fichier supprime apres download: {safe_name}")
+        except Exception:
+            pass
+        return response
+
+    return send_file(filepath, as_attachment=True, download_name=safe_name)
 
 
 @app.route('/api/status')
+@login_required
 def api_status():
-    """Endpoint pour vérifier quels providers sont configurés"""
     providers = {
         'anthropic': bool(ANTHROPIC_API_KEY),
         'openai': bool(OPENAI_API_KEY),
         'ollama': False
     }
-    # Test rapide Ollama
     try:
         r = requests.get(f'{OLLAMA_URL}/api/tags', timeout=3)
         providers['ollama'] = r.status_code == 200
@@ -876,7 +1040,7 @@ def api_status():
     return jsonify({
         'providers': providers,
         'active_providers': sum(1 for v in providers.values() if v),
-        'ollama_model': OLLAMA_MODEL
+        'file_retention_minutes': FILE_RETENTION_MINUTES
     })
 
 
@@ -886,28 +1050,38 @@ def api_status():
 
 if __name__ == '__main__':
     print("\n" + "="*50)
-    print("  AGENT COMPTABLE IA v3.0")
+    print("  AGENT COMPTABLE IA v4.0 SECURE")
     print("="*50)
 
-    # Afficher les providers actifs
-    print("\nProviders configures :")
-    print(f"  Claude  : {'OK' if ANTHROPIC_API_KEY else 'NON (ANTHROPIC_API_KEY manquant)'}")
-    print(f"  OpenAI  : {'OK' if OPENAI_API_KEY else 'NON (OPENAI_API_KEY manquant)'}")
+    print("\nSecurite :")
+    print(f"  Login         : {APP_USERNAME} / {'hash' if APP_PASSWORD_HASH else 'plain'}")
+    print(f"  Session       : {app.config['PERMANENT_SESSION_LIFETIME']}")
+    print(f"  CSRF          : actif")
+    print(f"  Anti-bruteforce: {MAX_LOGIN_ATTEMPTS} tentatives, lockout {LOCKOUT_DURATION}s")
+    print(f"  Zero Data     : fichiers supprimes apres {FILE_RETENTION_MINUTES} min")
+    print(f"  Headers       : CSP, X-Frame-Options, nosniff, no-cache")
+
+    print("\nProviders :")
+    print(f"  Claude  : {'OK' if ANTHROPIC_API_KEY else 'NON'}")
+    print(f"  OpenAI  : {'OK' if OPENAI_API_KEY else 'NON'}")
     try:
         r = requests.get(f'{OLLAMA_URL}/api/tags', timeout=3)
         print(f"  Ollama  : {'OK - ' + OLLAMA_MODEL if r.status_code == 200 else 'NON'}")
     except Exception:
-        print(f"  Ollama  : NON (serveur non accessible sur {OLLAMA_URL})")
+        print(f"  Ollama  : NON ({OLLAMA_URL})")
 
-    # Mode email
     if EMAIL_ADDRESS and EMAIL_PASSWORD:
         email_thread = threading.Thread(target=check_emails, daemon=True)
         email_thread.start()
-        print(f"\nEmail : surveillance activee ({EMAIL_ADDRESS})")
+        print(f"\nEmail : {EMAIL_ADDRESS}")
     else:
         print("\nEmail : non configure")
 
-    print(f"\nInterface web : http://localhost:5000")
+    # Thread de nettoyage automatique
+    cleanup_thread = threading.Thread(target=schedule_cleanup, daemon=True)
+    cleanup_thread.start()
+
+    print(f"\nInterface : http://localhost:5000")
     print("="*50 + "\n")
 
     app.run(host='0.0.0.0', port=5000, debug=False)
