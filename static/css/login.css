@@ -1,0 +1,110 @@
+body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.login-card {
+    background: var(--card);
+    border-radius: 20px;
+    padding: 48px 44px;
+    width: 100%;
+    max-width: 380px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+    animation: fadeUp 0.5s ease;
+}
+
+@keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.logo {
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.5px;
+    color: var(--text);
+    margin-bottom: 4px;
+}
+
+.subtitle {
+    font-size: 14px;
+    color: var(--text-secondary);
+    font-weight: 400;
+    margin-bottom: 36px;
+}
+
+.field {
+    margin-bottom: 16px;
+}
+
+.field label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+    margin-bottom: 6px;
+}
+
+.field input {
+    width: 100%;
+    padding: 11px 14px;
+    font-size: 15px;
+    font-family: inherit;
+    background: var(--bg);
+    border: 1px solid #d2d2d7;
+    border-radius: 12px;
+    color: var(--text);
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.field input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0,113,227,0.12);
+}
+
+.field input::placeholder {
+    color: #c7c7cc;
+}
+
+.error {
+    background: var(--error-bg);
+    color: var(--error);
+    font-size: 13px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin-bottom: 16px;
+    font-weight: 500;
+}
+
+.submit-btn {
+    width: 100%;
+    padding: 12px;
+    margin-top: 8px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 12px;
+    font-size: 15px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.submit-btn:hover {
+    background: var(--accent-hover);
+}
+
+.submit-btn:active {
+    transform: scale(0.99);
+}
+
+.footer {
+    text-align: center;
+    margin-top: 28px;
+    font-size: 11px;
+    color: #c7c7cc;
+    line-height: 1.6;
+}
